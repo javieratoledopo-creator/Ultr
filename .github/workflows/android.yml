@@ -1,0 +1,145 @@
+name: Build Android TV APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: artifacts/ultra-tv   # ruta dentro del zip descomprimido
+
+    steps:
+      - name: Checkout cÃ³digo
+        uses: actions/checkout@v4
+
+      - name: Descomprimir cÃ³digo fuente
+        working-directory: .
+        run: |
+          if [ -f "UltraTV-SourceCode.zip" ]; then
+            unzip -o UltraTV-SourceCode.zip -d .
+          else
+            echo "No se encontrÃ³ UltraTV-SourceCode.zip en la raÃ­z del repo"
+            exit 1
+          fi
+          echo "--- Contenido descomprimido ---"
+          find artifacts/ultra-tv -maxdepth 1
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configurar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Agregar Capacitor al proyecto
+        run: |
+          npm pkg set dependencies.@capacitor/core="^6.2.0"
+          npm pkg set dependencies.@capacitor/android="^6.2.0"
+          npm pkg set devDependencies.@capacitor/cli="^6.2.0"
+
+      - name: Crear capacitor.config.ts (si no existe)
+        run: |
+          if [ ! -f "capacitor.config.ts" ]; then
+            cat > capacitor.config.ts << 'EOF'
+          import type { CapacitorConfig } from '@capacitor/cli';
+
+          const config: CapacitorConfig = {
+            appId: 'com.ultratv.app',
+            appName: 'UltraTV',
+            webDir: 'dist',
+            server: { androidScheme: 'https' },
+            android: { allowMixedContent: false },
+          };
+
+          export default config;
+          EOF
+          fi
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Instalar TypeScript (requerido por Capacitor para leer capacitor.config.ts)
+        run: npm install -D typescript
+
+      - name: Compilar la web app (Vite)
+        run: npm run build
+
+      - name: Agregar plataforma Android (primera vez)
+        run: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Generar banner de Android TV
+        run: |
+          mkdir -p android/app/src/main/res/drawable
+          python3 -c "
+          from PIL import Image, ImageDraw, ImageFont
+          img = Image.new('RGB', (320, 180), color=(10,10,10))
+          d = ImageDraw.Draw(img)
+          d.rectangle([0,0,320,6], fill=(220,38,38))
+          d.rectangle([0,174,320,180], fill=(220,38,38))
+          try:
+              f = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 40)
+          except:
+              f = ImageFont.load_default()
+          t='ULTRA TV'
+          b=d.textbbox((0,0),t,font=f)
+          w=b[2]-b[0]; h=b[3]-b[1]
+          d.text(((320-w)/2,(180-h)/2-b[1]), t, fill=(255,255,255), font=f)
+          img.save('android/app/src/main/res/drawable/tv_banner.png')
+          " || echo "PIL no disponible, se omite banner"
+
+      - name: Configurar manifest para Android TV (Leanback launcher)
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+
+          if ! grep -q "android.software.leanback" "$MANIFEST"; then
+            sed -i 's#<application#<uses-feature android:name="android.software.leanback" android:required="true" />\n    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />\n\n    <application#' "$MANIFEST"
+          fi
+
+          if ! grep -q "android:banner" "$MANIFEST"; then
+            sed -i 's#<application#<application\n        android:banner="@drawable/tv_banner"#' "$MANIFEST"
+          fi
+
+          if ! grep -q "LEANBACK_LAUNCHER" "$MANIFEST"; then
+            sed -i 's#<category android:name="android.intent.category.LAUNCHER" />#<category android:name="android.intent.category.LAUNCHER" />\n                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />#' "$MANIFEST"
+          fi
+
+          sed -i 's#android:name="\.MainActivity"#android:name=".MainActivity"\n            android:screenOrientation="landscape"#' "$MANIFEST"
+
+          cat "$MANIFEST"
+
+      - name: Dar permisos a gradlew
+        run: chmod +x android/gradlew
+
+      - name: Compilar APK (release, sin firmar)
+        working-directory: artifacts/ultra-tv/android
+        run: ./gradlew assembleRelease
+
+      - name: Firmar el APK
+        uses: r0adkll/sign-android-release@v1
+        id: sign_apk
+        with:
+          releaseDirectory: artifacts/ultra-tv/android/app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.KEYSTORE_BASE64 }}
+          alias: ${{ secrets.KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Subir APK como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: UltraTV-apk
+          path: ${{ steps.sign_apk.outputs.signedReleaseFile }}
